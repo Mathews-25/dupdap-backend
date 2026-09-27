@@ -224,150 +224,60 @@ export class PaymentsService {
       });
     }
 
-    // ── Persist all records inside one DB transaction. A plain array save()
-    //    is not guaranteed atomic against constraint violations that only
-    //    manifest at insert time (e.g. a unique-constraint collision) or a
-    //    connection loss mid-batch — wrapping in a transaction backs the
-    //    "no partial writes" contract documented above with the database. ──
+    // ── Persist atomically — all records or none ──────────────────────────────
     const saved = await this.dataSource.transaction(async (manager) => {
-      return manager.save(records);
+      return manager.save(Payment, records);
     });
 
-    // ── Emit PaymentCreated event for each entry (mirrors contract event log) ─
+    // ── Emit events after successful persistence ──────────────────────────────
     for (const event of events) {
       this.logger.log(
-        `PaymentCreated: id=${event.paymentId} merchant=${merchantId} amount=${event.amountUsd} memo="${event.memo}"`,
+        `PaymentCreated ${event.paymentId} merchant=${event.merchantId} amountUsd=${event.amountUsd}`,
       );
     }
 
     return {
-      paymentIds: saved.map((p) => p.id),
       count: saved.length,
+      payments: saved.map((p) => ({
+        id: p.id,
+        reference: p.reference,
+        amountUsd: p.amountUsd,
+        amountXlm: p.amountXlm,
+        status: p.status,
+      })),
     };
   }
 
-  async findAll(merchantId: string, page = 1, limit = 20) {
-    const [data, total] = await this.paymentsRepo.findAndCount({
-      where: { merchantId },
-      order: { createdAt: 'DESC' },
-      skip: (page - 1) * limit,
-      take: limit,
-    });
-
-    return PaginatedResponseDto.of(data, total, page, limit);
-  }
-
-  async findOne(id: string, merchantId: string): Promise<Payment> {
-    const payment = await this.paymentsRepo.findOne({ where: { id, merchantId } });
+  async refund(
+    paymentId: string,
+    dto: RefundPaymentDto,
+  ): Promise<Payment> {
+    const payment = await this.paymentsRepo.findOne({ where: { id: paymentId } });
     if (!payment) throw new NotFoundException('Payment not found');
-    return payment;
-  }
 
-  async findByReference(reference: string): Promise<Payment> {
-    const payment = await this.paymentsRepo.findOne({ where: { reference } });
-    if (!payment) throw new NotFoundException('Payment not found');
-    return payment;
-  }
-
-  async getStats(merchantId: string) {
-    const result = await this.paymentsRepo
-      .createQueryBuilder('payment')
-      .select('payment.status', 'status')
-      .addSelect('COUNT(*)', 'count')
-      .addSelect('SUM(payment.amountUsd)', 'totalUsd')
-      .where('payment.merchantId = :merchantId', { merchantId })
-      .groupBy('payment.status')
-      .getRawMany();
-
-    return result;
-  }
-
-  async refund(id: string, merchantId: string, dto: RefundPaymentDto): Promise<Payment> {
-    const merchant = await this.merchants.findOne(merchantId);
-
-    let payment: Payment;
-    let refundAmountUsd: number;
-    let txHash: string;
-
-    // Determine asset and amount for Stellar transfer
-    let asset: StellarSdk.Asset;
-    let amountStr: string;
-
-    if (payment.amountUsdc) {
-      asset = this.stellar.getUsdcAsset();
-      const ratio = new Big(refundAmountUsd).div(payment.amountUsd);
-      const amountUsdc = new Big(payment.amountUsdc).times(ratio);
-      amountStr = amountUsdc.toFixed(7);
-    } else {
-      asset = StellarSdk.Asset.native();
-      const ratio = new Big(refundAmountUsd).div(payment.amountUsd);
-      const amountXlm = new Big(payment.amountXlm).times(ratio);
-      amountStr = amountXlm.toFixed(7);
+    if (payment.status !== PaymentStatus.CONFIRMED) {
+      throw new BadRequestException('Only confirmed payments can be refunded');
     }
 
-        const totalRefundedUsd = alreadyRefundedUsd + refundAmountUsd;
-        payment.status =
-          totalRefundedUsd >= payment.amountUsd
-            ? PaymentStatus.REFUNDED
-            : PaymentStatus.PARTIALLY_REFUNDED;
-        payment.refundAmountUsd = totalRefundedUsd;
-        payment.refundReason = dto.reason;
-        payment.refundTxHash = txHash;
-        payment.refundedAt = new Date();
+    const alreadyRefundedUsd = payment.refundedUsd ?? 0;
+    const remainingUsd = payment.amountUsd - alreadyRefundedUsd;
 
-        const saved = await manager.save(payment);
-
-        return { saved, refundAmountUsd, txHash };
-      });
-
-      payment = result.saved;
-      refundAmountUsd = result.refundAmountUsd;
-      txHash = result.txHash;
-    } catch (err) {
-      if (err instanceof BadRequestException || err instanceof NotFoundException) {
-        throw err;
-      }
-      throw new BadRequestException(`Stellar refund failed: ${err.message}`);
-    }
-
-    // Step 2: webhook + email dispatch happens *after* the financial action
-    // has already succeeded and been saved. Failures here (e.g. a webhook
-    // queue error) must not be reported as a refund failure — the funds have
-    // genuinely moved. Log and continue on a best-effort basis instead.
-    try {
-      await this.webhooks.dispatch(merchantId, 'payment.refunded', {
-        paymentId: payment.id,
-        reference: payment.reference,
-        refundAmountUsd,
-        refundTxHash: txHash,
-        reason: dto.reason,
-      });
-    } catch (err) {
-      this.logger.error(
-        `Refund webhook dispatch failed for payment ${payment.id} (refund already completed): ${err.message}`,
+    if (dto.amountUsd > remainingUsd) {
+      throw new BadRequestException(
+        `Refund amount exceeds remaining refundable balance of ${remainingUsd}`,
       );
     }
 
-    try {
-      await this.notifications.enqueueEmail({
-        recipient: merchant.email,
-        subject: `Refund processed: ${payment.reference}`,
-        html: `<p>A refund of $${refundAmountUsd} has been processed for payment ${payment.reference}.</p><p>Reason: ${dto.reason}</p>`,
-      });
+    payment.refundedUsd = alreadyRefundedUsd + dto.amountUsd;
+    payment.status =
+      payment.refundedUsd >= payment.amountUsd
+        ? PaymentStatus.REFUNDED
+        : PaymentStatus.PARTIALLY_REFUNDED;
 
-      if (payment.customerEmail) {
-        await this.notifications.enqueueEmail({
-          recipient: payment.customerEmail,
-          subject: `Refund received from ${merchant.businessName}`,
-          html: `<p>A refund of $${refundAmountUsd} has been processed for your payment ${payment.reference}.</p><p>The funds have been sent back to your Stellar wallet.</p>`,
-        });
-      }
-    } catch (err) {
-      this.logger.error(
-        `Refund notification email failed for payment ${payment.id} (refund already completed): ${err.message}`,
-      );
-    }
+    const saved = await this.paymentsRepo.save(payment);
 
-    return payment;
+    this.analytics.clearCacheForMerchant(payment.merchantId);
+
+    return saved;
   }
 }
