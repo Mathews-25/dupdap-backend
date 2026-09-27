@@ -1,78 +1,74 @@
-import {
-  Controller,
-  Get,
-  Post,
-  Param,
-  NotFoundException,
-  Logger,
-} from '@nestjs/common';
-import { InjectQueue } from '@nestjs/bull';
-import type { Queue, Job } from 'bull';
-import { ApiTags, ApiBearerAuth, ApiOperation, ApiParam } from '@nestjs/swagger';
-import { UseGuards } from '@nestjs/common';
-import { JwtAuthGuard } from '../auth/guards/jwt.guard';
-import { QUEUE_LIST, QUEUE_NAMES } from './queue.constants';
-import { QueueMetricsService, QueueMetric } from './queue-metrics.service';
-
-const DLQ_ALERT_THRESHOLD = 10;
+import { Controller, Get, Param, Post, UseGuards } from '@nestjs/common';
+import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
+import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
+import { RolesGuard } from '../auth/guards/roles.guard';
+import { Roles } from '../auth/decorators/roles.decorator';
+import { MerchantRole } from '../merchants/enums/merchant-role.enum';
+import { QueueMetricsService } from './queue-metrics.service';
+import { InjectQueue } from '@nestjs/bullmq';
+import { Queue } from 'bullmq';
 
 @ApiTags('admin/queues')
 @ApiBearerAuth()
-@UseGuards(JwtAuthGuard)
+@UseGuards(JwtAuthGuard, RolesGuard)
+@Roles(MerchantRole.ADMIN)
 @Controller('admin/queues')
 export class QueueAdminController {
-  private readonly logger = new Logger(QueueAdminController.name);
-
   constructor(
-    @InjectQueue(QUEUE_NAMES.settlement) private settlementQ: Queue,
-    @InjectQueue(QUEUE_NAMES.webhook) private webhookQ: Queue,
-    @InjectQueue(QUEUE_NAMES.notification) private notificationQ: Queue,
-    @InjectQueue(QUEUE_NAMES.stellarMonitor) private stellarMonitorQ: Queue,
-    @InjectQueue(QUEUE_NAMES.sorobanEventDlq) private sorobanEventDlqQ: Queue,
-    private readonly metricsService: QueueMetricsService,
+    private readonly queueMetricsService: QueueMetricsService,
+    @InjectQueue('settlement') private readonly settlementQueue: Queue,
+    @InjectQueue('webhook') private readonly webhookQueue: Queue,
+    @InjectQueue('notification') private readonly notificationQueue: Queue,
+    @InjectQueue('stellar-monitor') private readonly stellarMonitorQueue: Queue,
+    @InjectQueue('soroban-event-dlq') private readonly sorobanEventDlqQueue: Queue,
   ) {}
 
   @Get('metrics')
-  @ApiOperation({ summary: 'Get queue depth and throughput metrics for all queues' })
-  async getMetrics(): Promise<QueueMetric[]> {
-    return this.metricsService.getMetrics();
-  }
-
-  private resolveQueue(name: string): Queue {
-    const map: Record<string, Queue> = {
-      [QUEUE_NAMES.settlement]: this.settlementQ,
-      [QUEUE_NAMES.webhook]: this.webhookQ,
-      [QUEUE_NAMES.notification]: this.notificationQ,
-      [QUEUE_NAMES.stellarMonitor]: this.stellarMonitorQ,
-      [QUEUE_NAMES.sorobanEventDlq]: this.sorobanEventDlqQ,
-    };
-    const queue = map[name];
-    if (!queue) throw new NotFoundException(`Queue "${name}" not found. Valid: ${QUEUE_LIST.join(', ')}`);
-    return queue;
+  async getMetrics() {
+    return this.queueMetricsService.getMetrics();
   }
 
   @Get(':name/failed')
-  @ApiOperation({ summary: 'List failed (DLQ) jobs for a queue' })
-  @ApiParam({ name: 'name', description: 'Queue name', enum: QUEUE_LIST })
-  async getFailedJobs(@Param('name') name: string): Promise<{ jobs: object[]; total: number }> {
-    const queue = this.resolveQueue(name);
-    const jobs: Job[] = await queue.getFailed();
-    if (jobs.length >= DLQ_ALERT_THRESHOLD) {
-      this.logger.warn(`DLQ alert: queue "${name}" has ${jobs.length} failed jobs (threshold: ${DLQ_ALERT_THRESHOLD})`);
-    }
-    return { jobs: jobs.map((j) => ({ id: j.id, name: j.name, data: j.data, failedReason: j.failedReason, attemptsMade: j.attemptsMade })), total: jobs.length };
+  async getFailedJobs(@Param('name') name: string) {
+    const queue = this.getQueue(name);
+    const jobs = await queue.getFailed();
+    return {
+      jobs: jobs.map((j) => ({
+        id: j.id,
+        name: j.name,
+        data: j.data,
+        failedReason: j.failedReason,
+        attemptsMade: j.attemptsMade,
+      })),
+      total: jobs.length,
+    };
   }
 
   @Post(':name/failed/:id/retry')
-  @ApiOperation({ summary: 'Retry a specific failed job' })
-  @ApiParam({ name: 'name', description: 'Queue name', enum: QUEUE_LIST })
-  @ApiParam({ name: 'id', description: 'Job ID' })
-  async retryFailedJob(@Param('name') name: string, @Param('id') id: string): Promise<{ message: string }> {
-    const queue = this.resolveQueue(name);
+  async retryFailedJob(@Param('name') name: string, @Param('id') id: string) {
+    const queue = this.getQueue(name);
     const job = await queue.getJob(id);
-    if (!job) throw new NotFoundException(`Job "${id}" not found in queue "${name}"`);
+    if (!job) {
+      return { success: false, message: 'Job not found' };
+    }
     await job.retry();
-    this.logger.log(`Retried job "${id}" in queue "${name}"`);
-    return { message: `Job "${id}" re-queued successfully` };
+    return { success: true };
+  }
+
+  private getQueue(name: string): Queue {
+    switch (name) {
+      case 'settlement':
+        return this.settlementQueue;
+      case 'webhook':
+        return this.webhookQueue;
+      case 'notification':
+        return this.notificationQueue;
+      case 'stellar-monitor':
+        return this.stellarMonitorQueue;
+      case 'soroban-event-dlq':
+        return this.sorobanEventDlqQueue;
+      default:
+        throw new Error(`Unknown queue: ${name}`);
+    }
   }
 }
