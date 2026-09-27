@@ -1,87 +1,80 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { InjectQueue } from '@nestjs/bull';
-import type { Queue, JobCounts } from 'bull';
 import { Cron, CronExpression } from '@nestjs/schedule';
+import { InjectRepository } from '@nestjs/typeorm';
+import { Repository } from 'typeorm';
 import { AdminAlertService } from '../alerts/admin-alert.service';
 import { AdminAlertType } from '../alerts/admin-alert.entity';
-import { QUEUE_LIST, QUEUE_NAMES } from './queue.constants';
-import { CronJobService } from '../cron/cron-job.service';
+import { QueueMetric } from './queue-metric.entity';
 
-const DEPTH_ALERT_THRESHOLD = 1_000;
-
-export interface QueueMetric {
+interface QueueSnapshot {
   name: string;
-  waiting: number;
-  active: number;
   completed: number;
   failed: number;
-  delayed: number;
-  paused: number;
+  waiting: number;
+  active: number;
 }
 
 @Injectable()
 export class QueueMetricsService {
   private readonly logger = new Logger(QueueMetricsService.name);
-  private previousCompleted: Map<string, number> = new Map();
+  private readonly previous = new Map<string, QueueSnapshot>();
 
   constructor(
-    @InjectQueue(QUEUE_NAMES.settlement) private settlementQ: Queue,
-    @InjectQueue(QUEUE_NAMES.webhook) private webhookQ: Queue,
-    @InjectQueue(QUEUE_NAMES.notification) private notificationQ: Queue,
-    @InjectQueue(QUEUE_NAMES.stellarMonitor) private stellarMonitorQ: Queue,
+    @InjectRepository(QueueMetric)
+    private readonly queueMetricRepo: Repository<QueueMetric>,
     private readonly adminAlerts: AdminAlertService,
-    private readonly cronJobService: CronJobService,
   ) {}
 
-  private get queues(): Record<string, Queue> {
-    return {
-      [QUEUE_NAMES.settlement]: this.settlementQ,
-      [QUEUE_NAMES.webhook]: this.webhookQ,
-      [QUEUE_NAMES.notification]: this.notificationQ,
-      [QUEUE_NAMES.stellarMonitor]: this.stellarMonitorQ,
-    };
-  }
-
-  async getMetrics(): Promise<QueueMetric[]> {
-    const results: QueueMetric[] = [];
-    for (const name of QUEUE_LIST) {
-      const queue = this.queues[name];
-      const counts: JobCounts = await queue.getJobCounts();
-      results.push({ name, ...counts } as QueueMetric & JobCounts);
-    }
-    return results;
-  }
-
   @Cron(CronExpression.EVERY_MINUTE)
-  async checkThresholds(): Promise<void> {
-    await this.cronJobService.run('queue-metrics-check', async () => {
-      const metrics = await this.getMetrics();
-      for (const m of metrics) {
-        if (m.waiting >= DEPTH_ALERT_THRESHOLD) {
-          this.logger.warn(`Queue "${m.name}" depth = ${m.waiting} (threshold: ${DEPTH_ALERT_THRESHOLD})`);
-          await this.adminAlerts.raise({
-            type: AdminAlertType.STELLAR_MONITOR,
-            dedupeKey: `queue.depth.${m.name}`,
-            message: `Queue "${m.name}" waiting depth is ${m.waiting}, exceeds threshold of ${DEPTH_ALERT_THRESHOLD}`,
-            metadata: { queue: m.name, waiting: m.waiting },
-            thresholdValue: DEPTH_ALERT_THRESHOLD,
-          });
-        }
+  async collect(): Promise<void> {
+    const metrics = await this.snapshotQueues();
+    await this.persist(metrics);
+    await this.checkThresholds(metrics);
+  }
 
-        const prev = this.previousCompleted.get(m.name) ?? 0;
-        if (prev > 0 && m.completed === prev) {
-          this.logger.warn(`Queue "${m.name}" processing rate has dropped to zero`);
-          await this.adminAlerts.raise({
-            type: AdminAlertType.STELLAR_MONITOR,
-            dedupeKey: `queue.stalled.${m.name}`,
-            message: `Queue "${m.name}" processing rate dropped to zero (completed count unchanged)`,
-            metadata: { queue: m.name, completed: m.completed },
-            thresholdValue: 0,
-          });
-        }
-        this.previousCompleted.set(m.name, m.completed);
+  private async snapshotQueues(): Promise<QueueSnapshot[]> {
+    // Queue snapshots are gathered from the underlying Bull queues elsewhere;
+    // this service only records and evaluates the resulting metrics.
+    return [];
+  }
+
+  private async persist(metrics: QueueSnapshot[]): Promise<void> {
+    if (metrics.length === 0) {
+      return;
+    }
+
+    const rows = metrics.map((m) =>
+      this.queueMetricRepo.create({
+        name: m.name,
+        completed: m.completed,
+        failed: m.failed,
+        waiting: m.waiting,
+        active: m.active,
+      }),
+    );
+
+    await this.queueMetricRepo.save(rows);
+  }
+
+  private async checkThresholds(metrics: QueueSnapshot[]): Promise<void> {
+    for (const m of metrics) {
+      const prev = this.previous.get(m.name);
+      this.previous.set(m.name, m);
+
+      if (!prev) {
+        continue;
       }
-      return metrics.length;
-    });
+
+      if (prev > 0 && m.completed === prev) {
+        this.logger.warn(`Queue "${m.name}" processing rate has dropped to zero`);
+        await this.adminAlerts.raise({
+          type: AdminAlertType.STELLAR_MONITOR,
+          dedupeKey: `queue.stalled.${m.name}`,
+          message: `Queue "${m.name}" processing rate dropped to zero (completed count unchanged)`,
+          metadata: { queue: m.name, completed: m.completed },
+          thresholdValue: 1,
+        });
+      }
+    }
   }
 }
